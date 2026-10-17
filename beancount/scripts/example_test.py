@@ -3,8 +3,10 @@ __license__ = "GNU GPLv2"
 
 import datetime
 import random
+import tempfile
 import textwrap
 import unittest
+from os import path
 
 import click.testing
 
@@ -79,6 +81,46 @@ class TestScriptExample(test_utils.ClickTestCase):
         self.assertIn("Assets:H2:US:BofA:Checking", accounts)
         self.assertNotIn("Assets:US:BofA:Checking", accounts)
         self.assertEqual(1, rv.stdout.count("\n* Prices\n"))
+
+    def test_generate_transactions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = path.join(tmpdir, "example.beancount")
+            rv = self.run_with_args(
+                example.main,
+                *("--seed", "3", "--date-begin", "2023-01-01", "--date-end", "2025-01-01"),
+                *("--transactions", "4000", "--no-validate", "--output", filename),
+            )
+            entries, errors, _ = loader.load_file(filename)
+        self.assertFalse(errors)
+        num_transactions = len(list(data.filter_txns(entries)))
+        self.assertIn(f"Generated {num_transactions} transactions", rv.output)
+        self.assertLess(abs(num_transactions / 4000 - 1), 0.25)
+
+    def test_generate_transactions_invalid(self):
+        runner = click.testing.CliRunner()
+        rv = runner.invoke(example.main, ["--transactions", "10"])
+        self.assertEqual(2, rv.exit_code)
+        self.assertIn("Too few transactions", rv.output)
+        rv = runner.invoke(example.main, ["--transactions", "10000", "--density", "2"])
+        self.assertEqual(2, rv.exit_code)
+        self.assertIn("mutually exclusive", rv.output)
+        rv = runner.invoke(example.main, ["--transactions", "1000000000"])
+        self.assertEqual(2, rv.exit_code)
+        self.assertIn("Too many transactions", rv.output)
+        for date_end in "2024-01-01", "2023-06-01":
+            rv = runner.invoke(
+                example.main,
+                [
+                    "--date-begin",
+                    "2024-01-01",
+                    "--date-end",
+                    date_end,
+                    "--transactions",
+                    "100",
+                ],
+            )
+            self.assertEqual(2, rv.exit_code)
+            self.assertIn("must be before the end date", rv.output)
 
 
 class TestExampleHelpers(unittest.TestCase):

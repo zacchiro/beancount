@@ -157,6 +157,13 @@ RETIREMENT_LIMITS = {
     None: D("18500"),
 }
 
+# Approximate number of transactions generated per household and per year: a
+# fixed part, plus a part proportional to the density. See main(). These were
+# fitted from measurements and are within a few percent for densities from 1 to
+# a few hundreds (trading saturates, which makes the relation slightly concave).
+TRANSACTIONS_PER_YEAR_FIXED = 220
+TRANSACTIONS_PER_YEAR_DENSITY = 165
+
 # Maximum density, beyond which generation would take forever (at this density, a
 # household generates over a million transactions per year).
 MAX_DENSITY = 10_000
@@ -2006,6 +2013,8 @@ def write_example_file(
         and prices, and each household is written out as soon as it is generated.
         (This only limits memory usage if validate is false, as validation
         requires the entire contents.)
+    Returns:
+      An integer, the number of transactions generated.
     """
     dcontext = display_context.DisplayContext()
     default_int_digits = 8
@@ -2060,6 +2069,7 @@ def write_example_file(
     if households > 1:
         write_contents(header)
 
+    num_transactions = 0
     checking_accounts = []
     price_entries = None
     width = len(str(households))
@@ -2068,6 +2078,11 @@ def write_example_file(
         logging.info("Generating Household %s", component or "")
         sections, employer_name, price_entries = generate_household(
             date_birth, date_begin, date_end, density, price_entries
+        )
+        num_transactions += sum(
+            isinstance(entry, data.Transaction)
+            for _, _, entries in sections
+            for entry in entries
         )
         level_offset = 0
         chunk = ""
@@ -2097,6 +2112,8 @@ def write_example_file(
         validate_output(
             "".join(contents_list), checking_accounts, replace("CCY", replacements)
         )
+
+    return num_transactions
 
 
 def parse_date_liberally(string, parse_kwargs_dict=None):
@@ -2139,6 +2156,16 @@ class LiberalDate(click.ParamType):
     ),
 )
 @click.option(
+    "--transactions",
+    type=click.IntRange(min=1),
+    help=(
+        "Approximate number of transactions to generate, achieved by computing the "
+        "density from the date range and the number of households. The number "
+        "generated varies with the random seed and is printed. Incompatible with "
+        "--density."
+    ),
+)
+@click.option(
     "--households",
     type=click.IntRange(min=1),
     default=1,
@@ -2162,6 +2189,7 @@ def main(
     no_reformat,
     no_validate,
     density,
+    transactions,
     households,
     output,
     verbose,
@@ -2194,8 +2222,30 @@ def main(
         raise click.BadParameter(
             f"must be positive and at most {MAX_DENSITY}.", param_hint="'--density'"
         )
+    if date_begin >= date_end:
+        raise click.UsageError("The beginning date must be before the end date.")
+    if transactions is not None:
+        if density is not None:
+            raise click.UsageError("--density and --transactions are mutually exclusive.")
+        years = (date_end - date_begin).days / 365.25
+        per_household_year = transactions / (households * years)
+        density = (
+            per_household_year - TRANSACTIONS_PER_YEAR_FIXED
+        ) / TRANSACTIONS_PER_YEAR_DENSITY
+        if density <= 0:
+            minimum = math.ceil(TRANSACTIONS_PER_YEAR_FIXED * households * years)
+            raise click.UsageError(
+                f"Too few transactions requested for the date range and households; "
+                f"generating at least {minimum} transactions is required."
+            )
+        if density > MAX_DENSITY:
+            raise click.UsageError(
+                "Too many transactions requested for the date range and households; "
+                "use a longer date range or more households."
+            )
+        logging.info("Density = %s", density)
 
-    write_example_file(
+    num_transactions = write_example_file(
         date_birth,
         date_begin,
         date_end,
@@ -2205,3 +2255,8 @@ def main(
         density=density or 1.0,
         households=households,
     )
+    if transactions is not None:
+        click.echo(
+            f"Generated {num_transactions} transactions ({transactions} requested).",
+            err=True,
+        )
