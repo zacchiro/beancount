@@ -156,6 +156,10 @@ RETIREMENT_LIMITS = {
     None: D("18500"),
 }
 
+# Maximum density, beyond which generation would take forever (at this density, a
+# household generates over a million transactions per year).
+MAX_DENSITY = 10_000
+
 FILE_PREAMBLE = """\
 ;; -*- mode: org; mode: beancount; -*-
 ;; Birth: {date_birth}
@@ -269,7 +273,7 @@ def date_iter(date_begin, date_end):
         yield date
 
 
-def date_random_seq(date_begin, date_end, days_min, days_max):
+def date_random_seq(date_begin, date_end, days_min, days_max, density=1.0):
     """Generate a sequence of dates with some random increase in days.
 
     Args:
@@ -277,18 +281,54 @@ def date_random_seq(date_begin, date_end, days_min, days_max):
       date_end: The end date.
       days_min: The minimum number of days to advance on each iteration.
       days_max: The maximum number of days to advance on each iteration.
+      density: A float, the factor by which to divide the advance on each
+        iteration. Above 1, the same date may be produced multiple times.
     Yields:
       Instances of datetime.date.
     """
     assert days_min > 0
     assert days_min <= days_max
-    date = date_begin
-    while date < date_end:
-        nb_days_forward = random.randint(days_min, days_max)
-        date += datetime.timedelta(days=nb_days_forward)
-        if date >= date_end:
-            break
-        yield date
+    # Compare offsets rather than dates, as a tiny density can produce an offset
+    # beyond the range of datetime.date.
+    num_days = (date_end - date_begin).days
+    days = 0.0
+    while days < num_days:
+        days += random.randint(days_min, days_max) / density
+        if days < num_days:
+            yield date_begin + datetime.timedelta(days=int(days))
+
+
+def random_count(probability, density):
+    """Draw how many times an event of some daily probability occurs in a day.
+
+    The expected count is the probability scaled by the density. At a density of
+    1 this draws a single Bernoulli variate.
+
+    Args:
+      probability: A float, the probability of the event at a density of 1.
+      density: A float, the factor by which to scale the expected count.
+    Returns:
+      An integer, the number of occurrences.
+    """
+    trials = max(1, math.ceil(density))
+    probability_trial = probability * density / trials
+    return sum(random.random() < probability_trial for _ in range(trials))
+
+
+def scale_amount(number, density):
+    """Scale down an amount to keep the total spending constant under some density.
+
+    Args:
+      number: A float or Decimal, an amount at a density of 1.
+      density: A float, the factor by which more transactions are generated.
+    Returns:
+      The scaled amount, of the same sign and never smaller than one cent in
+      absolute value.
+    """
+    if density == 1:
+        return number
+    scaled = float(number) / density
+    return math.copysign(max(abs(scaled), 0.01), scaled)
 
 
 def delay_dates(date_iter, delay_days_min, delay_days_max):
@@ -813,7 +853,9 @@ def generate_banking(entries, date_begin, date_end, amount_initial):
     return new_entries + bal_entries
 
 
-def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks):
+def generate_taxable_investment(
+    date_begin, date_end, entries, price_map, stocks, density=1.0
+):
     """Generate opening directives and transactions for an investment account.
 
     Args:
@@ -823,6 +865,10 @@ def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks
         account's cash account.
       price_map: A dict of prices, as per beancount.core.prices.build_price_map().
       stocks: A list of strings, the list of commodities to invest in.
+      density: A float, the factor by which to multiply the frequency of trades.
+        The amount invested on each trade is divided by it, so the number of
+        trades is ultimately limited by available cash and whole shares. The
+        daily probabilities of buying and selling are capped at 1/2.
     Returns:
       A list of directives.
     """
@@ -857,14 +903,15 @@ def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks
 
     # Iterate over all the dates, but merging in the postings for the cash
     # account.
-    min_amount = D("1000.00")
-    round_amount = D("100.00")
+    density_number = D(str(density))
+    min_amount = D("1000.00") / density_number
+    round_amount = D("100.00") / density_number
     commission = D("8.95")
     round_units = D("1")
-    frac_invest = D("1.00")
+    frac_invest = min(D("1.00"), D("1.00") / density_number)
     frac_dividend = D("0.004")
-    p_daily_buy = 1.0 / 15  # days
-    p_daily_sell = 1.0 / 90  # days
+    p_daily_buy = min(density / 15, 0.5)  # days
+    p_daily_sell = min(density / 90, 0.5)  # days
 
     stocks_inventory = inventory.Inventory()
     new_entries = []
@@ -1356,7 +1403,7 @@ def generate_banking_expenses(date_begin, date_end, account, rent_amount):
 
 
 def generate_regular_credit_expenses(
-    date_birth, date_begin, date_end, account_credit, account_checking
+    date_birth, date_begin, date_end, account_credit, account_checking, density=1.0
 ):
     """Generate expenses paid out of a credit card account, including payments to the
     credit card.
@@ -1367,28 +1414,38 @@ def generate_regular_credit_expenses(
       date_end: The end date.
       account_credit: The credit card account to generate expenses against.
       account_checking: The checking account to generate payments from.
+      density: A float, the factor by which to multiply the number of restaurant
+        and groceries expenses (while dividing their amounts).
     Returns:
       A list of directives.
     """
     restaurant_expenses = generate_periodic_expenses(
-        date_random_seq(date_begin, date_end, 1, 5),
+        date_random_seq(date_begin, date_end, 1, 5, density),
         RESTAURANT_NAMES,
         RESTAURANT_NARRATIONS,
         account_credit,
         "Expenses:Food:Restaurant",
-        lambda: min(
-            random.lognormvariate(math.log(30), math.log(1.5)), random.randint(200, 220)
+        lambda: scale_amount(
+            min(
+                random.lognormvariate(math.log(30), math.log(1.5)),
+                random.randint(200, 220),
+            ),
+            density,
         ),
     )
 
     groceries_expenses = generate_periodic_expenses(
-        date_random_seq(date_begin, date_end, 5, 20),
+        date_random_seq(date_begin, date_end, 5, 20, density),
         GROCERIES_NAMES,
         "Buying groceries",
         account_credit,
         "Expenses:Food:Groceries",
-        lambda: min(
-            random.lognormvariate(math.log(80), math.log(1.3)), random.randint(250, 300)
+        lambda: scale_amount(
+            min(
+                random.lognormvariate(math.log(80), math.log(1.3)),
+                random.randint(250, 300),
+            ),
+            density,
         ),
     )
 
@@ -1445,7 +1502,7 @@ def compute_trip_dates(date_begin, date_end):
 
 
 def generate_trip_entries(
-    date_begin, date_end, tag, config, trip_city, home_city, account_credit
+    date_begin, date_end, tag, config, trip_city, home_city, account_credit, density=1.0
 ):
     """Generate more dense expenses for a trip.
 
@@ -1460,6 +1517,8 @@ def generate_trip_entries(
       home_city: A string, the name of the home city.
       account_credit: A string, the name of the credit card account to pay
         the expenses from.
+      density: A float, the factor by which to multiply the number of expenses
+        (while dividing their amounts).
     Returns:
       A list of entries for the trip, all tagged with the given tag.
     """
@@ -1468,8 +1527,8 @@ def generate_trip_entries(
     new_entries = []
     for date in date_iter(date_begin, date_end):
         for payee, account_expense, (mu, sigma3) in config:
-            if random.random() < p_day_generate:
-                amount = random.normalvariate(mu, sigma3 / 3.0)
+            for _ in range(random_count(p_day_generate, density)):
+                amount = scale_amount(random.normalvariate(mu, sigma3 / 3.0), density)
                 new_entries.append(
                     new_transaction(
                         date,
@@ -1673,7 +1732,9 @@ def contextualize_file(contents, employer):
     return new_contents, replacements
 
 
-def write_example_file(date_birth, date_begin, date_end, reformat, file, validate=True):
+def write_example_file(
+    date_birth, date_begin, date_end, reformat, file, validate=True, density=1.0
+):
     """Generate the example file.
 
     Args:
@@ -1686,6 +1747,9 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file, validat
       file: A file object, where to write out the output.
       validate: A boolean, true if we should load and validate the output after
         writing it out.
+      density: A float, the factor by which to multiply the number of everyday
+        transactions, see generate_regular_credit_expenses(),
+        generate_trip_entries() and generate_taxable_investment().
     """
     # The following code entirely writes out the output to generic names, such
     # as "Employer1", "Bank1", and "CCY" (for principal currency). Those names
@@ -1727,7 +1791,7 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file, validat
 
     logging.info("Generating Regular Expenses via Credit Card")
     credit_regular_entries = generate_regular_credit_expenses(
-        date_birth, date_begin, date_end, account_credit, account_checking
+        date_birth, date_begin, date_end, account_credit, account_checking, density
     )
 
     logging.info("Generating Credit Card Expenses for Trips")
@@ -1760,6 +1824,7 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file, validat
             destination_name.replace("-", " ").title(),
             HOME_NAME,
             account_credit,
+            density,
         )
 
         trip_entries.extend(this_trip_entries)
@@ -1849,7 +1914,7 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file, validat
 
     logging.info("Generating Taxes Investments")
     investment_entries = generate_taxable_investment(
-        date_begin, date_end, banking_transfers, price_map, stocks
+        date_begin, date_end, banking_transfers, price_map, stocks, density
     )
 
     logging.info("Generating Expense Accounts")
@@ -1973,6 +2038,14 @@ class LiberalDate(click.ParamType):
     ),
 )
 @click.option(
+    "--density",
+    type=float,
+    help=(
+        "Factor by which to multiply the number of everyday transactions (restaurants, "
+        "groceries, trips, trades), dividing their amounts accordingly. Default: 1."
+    ),
+)
+@click.option(
     "--output",
     "-o",
     type=click.File("w", encoding="utf-8"),
@@ -1988,6 +2061,7 @@ def main(
     seed,
     no_reformat,
     no_validate,
+    density,
     output,
     verbose,
 ):
@@ -2013,6 +2087,13 @@ def main(
         logging.info("Seed = %s", seed)
         random.seed(seed)
 
+    # Note: With click >= 8.0, this check can be replaced by declaring the option
+    # with type=click.FloatRange(min=0, max=MAX_DENSITY, min_open=True).
+    if density is not None and not 0 < density <= MAX_DENSITY:
+        raise click.BadParameter(
+            f"must be positive and at most {MAX_DENSITY}.", param_hint="'--density'"
+        )
+
     write_example_file(
         date_birth,
         date_begin,
@@ -2020,4 +2101,5 @@ def main(
         reformat,
         file=output,
         validate=not no_validate,
+        density=density or 1.0,
     )
