@@ -3,12 +3,14 @@ __license__ = "GNU GPLv2"
 
 import datetime
 import random
+import textwrap
 import unittest
 
 import click.testing
 
 from beancount import loader
 from beancount.core import data
+from beancount.core import getters
 from beancount.core.number import D
 from beancount.ops import validation
 from beancount.scripts import example
@@ -62,6 +64,22 @@ class TestScriptExample(test_utils.ClickTestCase):
             self.assertEqual(2, rv.exit_code)
             self.assertIn("Invalid value for '--density'", rv.output)
 
+    def test_generate_households(self):
+        rv = self.run_with_args(
+            example.main,
+            *("--seed", "2", "--date-begin", "2024-01-01", "--date-end", "2025-01-01"),
+            *("--households", "2", "--density", "0.5"),
+        )
+        entries, errors, _ = loader.load_string(
+            rv.stdout, extra_validations=validation.HARDCORE_VALIDATIONS
+        )
+        self.assertFalse(errors)
+        accounts = getters.get_accounts(entries)
+        self.assertIn("Assets:H1:US:BofA:Checking", accounts)
+        self.assertIn("Assets:H2:US:BofA:Checking", accounts)
+        self.assertNotIn("Assets:US:BofA:Checking", accounts)
+        self.assertEqual(1, rv.stdout.count("\n* Prices\n"))
+
 
 class TestExampleHelpers(unittest.TestCase):
     def test_date_random_seq_density(self):
@@ -102,6 +120,25 @@ class TestExampleHelpers(unittest.TestCase):
         self.assertAlmostEqual(-1.5, example.scale_amount(-15.0, 10.0))
         self.assertEqual(-0.01, example.scale_amount(-15.0, 10000.0))
         self.assertEqual(-15.0, example.scale_amount(-15.0, 1))
+
+    def test_prefix_accounts(self):
+        self.assertEqual(
+            textwrap.dedent("""\
+              2020-01-01 open Assets:H7:US:BofA:Checking
+              2020-01-02 * "Equity: not an account" "Income"
+                Expenses:H7:Food:Restaurant   1.00 USD
+                Liabilities:H7:US:Chase:Slate
+            """),
+            example.prefix_accounts(
+                textwrap.dedent("""\
+                  2020-01-01 open Assets:US:BofA:Checking
+                  2020-01-02 * "Equity: not an account" "Income"
+                    Expenses:Food:Restaurant   1.00 USD
+                    Liabilities:US:Chase:Slate
+                """),
+                "H7",
+            ),
+        )
 
 
 if __name__ == "__main__":

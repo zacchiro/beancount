@@ -22,6 +22,7 @@ import dateutil.parser
 from dateutil import rrule
 
 from beancount import loader
+from beancount.core import account_types
 from beancount.core import amount
 from beancount.core import convert
 from beancount.core import data
@@ -1732,10 +1733,8 @@ def contextualize_file(contents, employer):
     return new_contents, replacements
 
 
-def write_example_file(
-    date_birth, date_begin, date_end, reformat, file, validate=True, density=1.0
-):
-    """Generate the example file.
+def generate_household(date_birth, date_begin, date_end, density=1.0, price_entries=None):
+    """Generate the entries of a single household.
 
     Args:
       date_birth: A datetime.date instance, the birth date of our character.
@@ -1743,13 +1742,17 @@ def write_example_file(
         transactions.
       date_end: A datetime.date instance, the end date at which to generate
         transactions.
-      reformat: A boolean, true if we should apply global reformatting to this file.
-      file: A file object, where to write out the output.
-      validate: A boolean, true if we should load and validate the output after
-        writing it out.
       density: A float, the factor by which to multiply the number of everyday
         transactions, see generate_regular_credit_expenses(),
         generate_trip_entries() and generate_taxable_investment().
+      price_entries: A list of Price directives for the investment commodities, or
+        None to generate new ones.
+    Returns:
+      A tuple of
+        sections: A list of (level, title, entries) tuples, the org-mode sections to
+          output, with their level of nesting.
+        employer_name: A string, the name of the employer.
+        price_entries: A list of Price directives, those given or generated.
     """
     # The following code entirely writes out the output to generic names, such
     # as "Employer1", "Bank1", and "CCY" (for principal currency). Those names
@@ -1763,9 +1766,6 @@ def write_example_file(
     account_credit = "Liabilities:CC:CreditCard1"
     account_retirement = "Assets:CC:Retirement"
     account_investing = "Assets:CC:Investment:Cash"
-
-    # Commodities.
-    commodity_entries = generate_commodity_entries(date_birth)
 
     # Estimate the rent.
     rent_amount = round_to(ANNUAL_SALARY / RENT_DIVISOR, RENT_INCREMENT)
@@ -1888,14 +1888,15 @@ def write_example_file(
         transfer_increment=D("500"),
     )
 
-    logging.info("Generating Prices")
     # Generate price entries for investment currencies and create a price map to
     # use for later for generating investment transactions.
     funds_allocation = {"MFUND1": 0.40, "MFUND2": 0.60}
     stocks = ["STK1", "STK2", "STK3", "STK4"]
-    price_entries = generate_prices(
-        date_begin, date_end, sorted(funds_allocation.keys()) + stocks, "CCY"
-    )
+    if price_entries is None:
+        logging.info("Generating Prices")
+        price_entries = generate_prices(
+            date_begin, date_end, sorted(funds_allocation.keys()) + stocks, "CCY"
+        )
     price_map = prices.build_price_map(price_entries)
 
     logging.info("Generating Employer Match Contribution")
@@ -1941,7 +1942,71 @@ def write_example_file(
         date_random_seq(date_begin, date_end, 20, 30),
     )
 
-    logging.info("Outputting and Formatting Entries")
+    sections = [
+        (1, "Equity Accounts", equity_entries),
+        (
+            1,
+            "Banking",
+            banking_entries + banking_expenses + banking_transfers + banking_checks,
+        ),
+        (1, "Credit-Cards", credit_entries + credit_checks),
+        (1, "Taxable Investments", investment_entries),
+        (1, "Retirement Investments", retirement_entries + retirement_match),
+        (1, "Sources of Income", income_entries),
+        (1, "Taxes", tax_preamble),
+    ]
+    sections.extend((2, "Tax Year {}".format(year), entries) for year, entries in taxes)
+    sections.append((1, "Expenses", expense_accounts_entries))
+    return sections, employer_name, price_entries
+
+
+def prefix_accounts(contents, component):
+    """Insert a component after the root of all the account names.
+
+    Args:
+      contents: A string, Beancount input syntax.
+      component: A string, the account component to insert.
+    Returns:
+      A string, the input with account names such as "Assets:Bank" renamed to
+      "Assets:<component>:Bank".
+    """
+    roots = "|".join(account_types.DEFAULT_ACCOUNT_TYPES)
+    return re.sub(
+        r"(?<![\w:])({})(?=:[A-Z0-9])".format(roots), r"\1:{}".format(component), contents
+    )
+
+
+def write_example_file(
+    date_birth,
+    date_begin,
+    date_end,
+    reformat,
+    file,
+    validate=True,
+    density=1.0,
+    households=1,
+):
+    """Generate the example file.
+
+    Args:
+      date_birth: A datetime.date instance, the birth date of our character.
+      date_begin: A datetime.date instance, the beginning date at which to generate
+        transactions.
+      date_end: A datetime.date instance, the end date at which to generate
+        transactions.
+      reformat: A boolean, true if we should apply global reformatting to this file.
+      file: A file object, where to write out the output.
+      validate: A boolean, true if we should load and validate the output after
+        writing it out.
+      density: A float, the factor by which to multiply the number of everyday
+        transactions, see generate_household().
+      households: An integer, the number of independent households to generate.
+        If more than one, the account names of each household are prefixed with a
+        distinct component (e.g., "Assets:H1:..."), they share the same commodities
+        and prices, and each household is written out as soon as it is generated.
+        (This only limits memory usage if validate is false, as validation
+        requires the entire contents.)
+    """
     dcontext = display_context.DisplayContext()
     default_int_digits = 8
     for currency, precision in {
@@ -1961,48 +2026,76 @@ def write_example_file(
             int_digits += 1 + precision
         dcontext.update(D("{{:0{}.{}f}}".format(int_digits, precision).format(0)), currency)
 
-    output = io.StringIO()
+    def format_sections(sections, level_offset=0):
+        output = io.StringIO()
+        for level, title, entries in sections:
+            stars = "*" * (level + level_offset)
+            output.write("\n\n\n{} {}\n\n".format(stars, title))
+            printer.print_entries(data.sorted(entries), dcontext, file=output)
+        return output.getvalue()
 
-    def output_section(title, entries):
-        output.write("\n\n\n{}\n\n".format(title))
-        printer.print_entries(data.sorted(entries), dcontext, file=output)
+    # The contents consist of a header, the households and a footer. If there are
+    # multiple households, we reformat and write out each part as soon as it's
+    # generated. Otherwise, we reformat the whole file at once.
+    contents_list = []
 
-    output.write(FILE_PREAMBLE.format(**locals()))
-    output_section("* Commodities", commodity_entries)
-    output_section("* Equity Accounts", equity_entries)
-    output_section(
-        "* Banking",
-        data.sorted(
-            banking_entries + banking_expenses + banking_transfers + banking_checks
-        ),
+    def write_contents(contents):
+        if reformat:
+            logging.info("Formatting Entries")
+            contents = format.align_beancount(contents)
+        logging.info("Writing contents")
+        file.write(contents)
+        if validate:
+            contents_list.append(contents)
+
+    # Note: The header and footer don't refer to any employer.
+    commodity_entries = generate_commodity_entries(date_birth)
+    header, _ = contextualize_file(
+        FILE_PREAMBLE.format(
+            date_birth=date_birth, date_begin=date_begin, date_end=date_end
+        )
+        + format_sections([(1, "Commodities", commodity_entries)]),
+        "Employer1",
     )
-    output_section("* Credit-Cards", data.sorted(credit_entries + credit_checks))
-    output_section("* Taxable Investments", investment_entries)
-    output_section(
-        "* Retirement Investments", data.sorted(retirement_entries + retirement_match)
+    if households > 1:
+        write_contents(header)
+
+    checking_accounts = []
+    price_entries = None
+    width = len(str(households))
+    for index in range(households):
+        component = "H{:0{}}".format(index + 1, width) if households > 1 else None
+        logging.info("Generating Household %s", component or "")
+        sections, employer_name, price_entries = generate_household(
+            date_birth, date_begin, date_end, density, price_entries
+        )
+        level_offset = 0
+        chunk = ""
+        if component:
+            chunk = "\n\n\n* Household {}\n".format(component)
+            level_offset = 1
+        chunk += format_sections(sections, level_offset)
+        chunk, replacements = contextualize_file(chunk, employer_name)
+        account_checking = replace("Assets:CC:Bank1:Checking", replacements)
+        if component:
+            chunk = prefix_accounts(chunk, component)
+            account_checking = prefix_accounts(account_checking, component)
+        checking_accounts.append(account_checking)
+        if households > 1:
+            write_contents(chunk)
+
+    footer, replacements = contextualize_file(
+        format_sections([(1, "Prices", price_entries), (1, "Cash", [])]), "Employer1"
     )
-    output_section("* Sources of Income", income_entries)
-    output_section("* Taxes", tax_preamble)
-    for year, entries in taxes:
-        output_section("** Tax Year {}".format(year), entries)
-    output_section("* Expenses", expense_accounts_entries)
-    output_section("* Prices", price_entries)
-    output_section("* Cash", [])
-
-    logging.info("Contextualizing to Realistic Names")
-    contents, replacements = contextualize_file(output.getvalue(), employer_name)
-    if reformat:
-        contents = format.align_beancount(contents)
-
-    logging.info("Writing contents")
-    file.write(contents)
+    if households > 1:
+        write_contents(footer)
+    else:
+        write_contents(header + chunk + footer)
 
     if validate:
         logging.info("Validating Results")
         validate_output(
-            contents,
-            [replace(account, replacements) for account in [account_checking]],
-            replace("CCY", replacements),
+            "".join(contents_list), checking_accounts, replace("CCY", replacements)
         )
 
 
@@ -2034,7 +2127,7 @@ class LiberalDate(click.ParamType):
     help=(
         "Do not load and validate the output after generating it. This is faster, "
         "and necessary to limit memory usage when generating large outputs, as "
-        "validation holds the entire output in memory."
+        "validation holds the entire output in memory, even with --households."
     ),
 )
 @click.option(
@@ -2044,6 +2137,13 @@ class LiberalDate(click.ParamType):
         "Factor by which to multiply the number of everyday transactions (restaurants, "
         "groceries, trips, trades), dividing their amounts accordingly. Default: 1."
     ),
+)
+@click.option(
+    "--households",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Number of independent households to generate, with distinct accounts.",
 )
 @click.option(
     "--output",
@@ -2062,6 +2162,7 @@ def main(
     no_reformat,
     no_validate,
     density,
+    households,
     output,
     verbose,
 ):
@@ -2102,4 +2203,5 @@ def main(
         file=output,
         validate=not no_validate,
         density=density or 1.0,
+        households=households,
     )
