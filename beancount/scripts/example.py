@@ -1673,7 +1673,7 @@ def contextualize_file(contents, employer):
     return new_contents, replacements
 
 
-def write_example_file(date_birth, date_begin, date_end, reformat, file):
+def write_example_file(date_birth, date_begin, date_end, reformat, file, validate=True):
     """Generate the example file.
 
     Args:
@@ -1684,6 +1684,8 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file):
         transactions.
       reformat: A boolean, true if we should apply global reformatting to this file.
       file: A file object, where to write out the output.
+      validate: A boolean, true if we should load and validate the output after
+        writing it out.
     """
     # The following code entirely writes out the output to generic names, such
     # as "Employer1", "Bank1", and "CCY" (for principal currency). Those names
@@ -1930,12 +1932,13 @@ def write_example_file(date_birth, date_begin, date_end, reformat, file):
     logging.info("Writing contents")
     file.write(contents)
 
-    logging.info("Validating Results")
-    validate_output(
-        contents,
-        [replace(account, replacements) for account in [account_checking]],
-        replace("CCY", replacements),
-    )
+    if validate:
+        logging.info("Validating Results")
+        validate_output(
+            contents,
+            [replace(account, replacements) for account in [account_checking]],
+            replace("CCY", replacements),
+        )
 
 
 def parse_date_liberally(string, parse_kwargs_dict=None):
@@ -1961,6 +1964,15 @@ class LiberalDate(click.ParamType):
 @click.option("--seed", "-s", type=int, help="Random seed.")
 @click.option("--no-reformat", is_flag=True, help="Do not reformat the output.")
 @click.option(
+    "--no-validate",
+    is_flag=True,
+    help=(
+        "Do not load and validate the output after generating it. This is faster, "
+        "and necessary to limit memory usage when generating large outputs, as "
+        "validation holds the entire output in memory."
+    ),
+)
+@click.option(
     "--output",
     "-o",
     type=click.File("w", encoding="utf-8"),
@@ -1969,7 +1981,16 @@ class LiberalDate(click.ParamType):
 )
 @click.option("--verbose", "-v", type=bool, help="Produce logging output.")
 @click.version_option(message=VERSION)
-def main(date_begin, date_end, date_birth, seed, no_reformat, output, verbose):
+def main(
+    date_begin,
+    date_end,
+    date_birth,
+    seed,
+    no_reformat,
+    no_validate,
+    output,
+    verbose,
+):
     """Generate a decently-sized example history, based on some rules.
 
     This script is used to generate some meaningful input to
@@ -1992,4 +2013,11 @@ def main(date_begin, date_end, date_birth, seed, no_reformat, output, verbose):
         logging.info("Seed = %s", seed)
         random.seed(seed)
 
-    write_example_file(date_birth, date_begin, date_end, reformat, file=output)
+    write_example_file(
+        date_birth,
+        date_begin,
+        date_end,
+        reformat,
+        file=output,
+        validate=not no_validate,
+    )
