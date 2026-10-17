@@ -34,6 +34,7 @@ from beancount.core.account import join
 from beancount.core.number import ZERO
 from beancount.core.number import D
 from beancount.core.number import round_to
+from beancount.core.position import Cost
 from beancount.ops import validation
 from beancount.parser import booking
 from beancount.parser import parser
@@ -189,6 +190,67 @@ def parse(input_string):
     entries, unused_balance_errors = booking.book(entries, options_map)
 
     return data.sorted(entries)
+
+
+def fmt(number, spec):
+    """Round a number the way formatting it into parse() input would.
+
+    Args:
+      number: A Decimal or float.
+      spec: A format spec, e.g. ".2f".
+    Returns:
+      A Decimal instance.
+    """
+    return D(f"{number:{spec}}")
+
+
+def new_posting(account, number, currency, cost=None, price=None):
+    """Create a posting directly, as parse() would produce it.
+
+    Args:
+      account: An account string.
+      number: A Decimal, the number of units.
+      currency: A currency string.
+      cost: An optional Cost instance.
+      price: An optional Amount instance.
+    Returns:
+      A Posting instance, without metadata (see new_transaction()).
+    """
+    return data.Posting(account, amount.Amount(number, currency), cost, price, None, None)
+
+
+def new_transaction(date, payee, narration, postings, tags=data.EMPTY_SET, lineno=2):
+    """Create a transaction directly, as parse() would produce it.
+
+    This is much faster than formatting and parsing text, and is used by the
+    generators producing most of the transactions.
+
+    Args:
+      date: A datetime.date instance.
+      payee: A string or None.
+      narration: A string.
+      postings: A list of Posting instances, as created by new_posting().
+      tags: A set of tag strings.
+      lineno: An integer, the line number the transaction would have in its parse()
+        input. This is used as a sort key between directives of the same date, so it
+        must match the original line numbers to reproduce the same output.
+    Returns:
+      A Transaction instance.
+    """
+    postings = [
+        posting._replace(meta=data.new_metadata("<string>", lineno + index))
+        for index, posting in enumerate(postings, 1)
+    ]
+    return data.Transaction(
+        data.new_metadata("<string>", lineno),
+        date,
+        "*",
+        payee,
+        narration,
+        tags,
+        data.EMPTY_SET,
+        postings,
+    )
 
 
 def date_iter(date_begin, date_end):
@@ -466,44 +528,53 @@ def generate_employment_income(
             ctx.prec = 6
             deposit = gross - retirement - fixed - socsec
 
-        retirement_neg = -retirement
-        gross_neg = -gross
-        lifeinsurance_neg = -lifeinsurance
-        vacation_hrs_neg = -vacation_hrs
-
-        transactions.extend(
-            parse(
-                f"""
-            {date} * "{employer_name}" "Payroll"
-              {account_deposit}                                 {deposit:.2f} CCY
-              """
-                + (
-                    ""
-                    if retirement == ZERO
-                    else f"""\
-              {account_retirement}                              {retirement:.2f} CCY
-              Assets:CC:Federal:PreTax401k                      {retirement_neg:.2f} DEFCCY
-              Expenses:Taxes:Y{year}:CC:Federal:PreTax401k      {retirement:.2f} DEFCCY
-              """
-                )
-                + f"""\
-              Income:CC:Employer1:Salary                        {gross_neg:.2f} CCY
-              Income:CC:Employer1:GroupTermLife                 {lifeinsurance_neg:.2f} CCY
-              Expenses:Health:Life:GroupTermLife                {lifeinsurance:.2f} CCY
-              Expenses:Health:Dental:Insurance                  {dental} CCY
-              Expenses:Health:Medical:Insurance                 {medical} CCY
-              Expenses:Health:Vision:Insurance                  {vision} CCY
-              Expenses:Taxes:Y{year}:CC:Medicare                {medicare:.2f} CCY
-              Expenses:Taxes:Y{year}:CC:Federal                 {federal:.2f} CCY
-              Expenses:Taxes:Y{year}:CC:State                   {state:.2f} CCY
-              Expenses:Taxes:Y{year}:CC:CityNYC                 {city:.2f} CCY
-              Expenses:Taxes:Y{year}:CC:SDI                     {sdi:.2f} CCY
-              Expenses:Taxes:Y{year}:CC:SocSec                  {socsec:.2f} CCY
-              Assets:CC:Employer1:Vacation                      {vacation_hrs:.2f} VACHR
-              Income:CC:Employer1:Vacation                      {vacation_hrs_neg:.2f} VACHR
-        """
-            )
+        # Note: Postings are grouped by currency, as booking would.
+        taxes = f"Expenses:Taxes:Y{year}:CC"
+        postings = [new_posting(account_deposit, fmt(deposit, ".2f"), "CCY")]
+        if retirement != ZERO:
+            postings.append(new_posting(account_retirement, fmt(retirement, ".2f"), "CCY"))
+        postings.extend(
+            [
+                new_posting("Income:CC:Employer1:Salary", fmt(-gross, ".2f"), "CCY"),
+                new_posting(
+                    "Income:CC:Employer1:GroupTermLife", fmt(-lifeinsurance, ".2f"), "CCY"
+                ),
+                new_posting(
+                    "Expenses:Health:Life:GroupTermLife", fmt(lifeinsurance, ".2f"), "CCY"
+                ),
+                new_posting("Expenses:Health:Dental:Insurance", dental, "CCY"),
+                new_posting("Expenses:Health:Medical:Insurance", medical, "CCY"),
+                new_posting("Expenses:Health:Vision:Insurance", vision, "CCY"),
+                new_posting(f"{taxes}:Medicare", fmt(medicare, ".2f"), "CCY"),
+                new_posting(f"{taxes}:Federal", fmt(federal, ".2f"), "CCY"),
+                new_posting(f"{taxes}:State", fmt(state, ".2f"), "CCY"),
+                new_posting(f"{taxes}:CityNYC", fmt(city, ".2f"), "CCY"),
+                new_posting(f"{taxes}:SDI", fmt(sdi, ".2f"), "CCY"),
+                new_posting(f"{taxes}:SocSec", fmt(socsec, ".2f"), "CCY"),
+            ]
         )
+        if retirement != ZERO:
+            postings.extend(
+                [
+                    new_posting(
+                        "Assets:CC:Federal:PreTax401k", fmt(-retirement, ".2f"), "DEFCCY"
+                    ),
+                    new_posting(
+                        f"{taxes}:Federal:PreTax401k", fmt(retirement, ".2f"), "DEFCCY"
+                    ),
+                ]
+            )
+        postings.extend(
+            [
+                new_posting(
+                    "Assets:CC:Employer1:Vacation", fmt(vacation_hrs, ".2f"), "VACHR"
+                ),
+                new_posting(
+                    "Income:CC:Employer1:Vacation", fmt(-vacation_hrs, ".2f"), "VACHR"
+                ),
+            ]
+        )
+        transactions.append(new_transaction(date, employer_name, "Payroll", postings))
 
     return preamble + transactions
 
@@ -607,16 +678,18 @@ def generate_retirement_employer_match(entries, account_invest, account_income):
 
     for txn_posting, balances in postings_for(entries, [account_invest]):
         amount = txn_posting.posting.units.number * match_frac
-        amount_neg = -amount
         date = txn_posting.txn.date + ONE_DAY
-        new_entries.extend(
-            parse(f"""
-
-          {date} * "Employer match for contribution"
-            {account_invest}         {amount:.2f} CCY
-            {account_income}         {amount_neg:.2f} CCY
-
-        """)
+        new_entries.append(
+            new_transaction(
+                date,
+                None,
+                "Employer match for contribution",
+                [
+                    new_posting(account_invest, fmt(amount, ".2f"), "CCY"),
+                    new_posting(account_income, fmt(-amount, ".2f"), "CCY"),
+                ],
+                lineno=3,
+            )
         )
 
     return new_entries
@@ -675,15 +748,20 @@ def generate_retirement_investments(entries, account, commodities_items, price_m
             _, price = prices.get_price(price_map, (commodity, "CCY"), txn_date)
             units = (amount_fraction / price).quantize(D("0.001"))
             amount_cash = (units * price).quantize(D("0.01"))
-            amount_cash_neg = -amount_cash
-            new_entries.extend(
-                parse(f"""
-
-              {txn_date} * "Investing {fraction:.0%} of cash in {commodity}"
-                {account}:{commodity}  {units:.3f} {commodity} {{{price:.2f} CCY}}
-                {account}:Cash         {amount_cash_neg:.2f} CCY
-
-            """)
+            cost = Cost(fmt(price, ".2f"), "CCY", txn_date, None)
+            new_entries.append(
+                new_transaction(
+                    txn_date,
+                    None,
+                    f"Investing {fraction:.0%} of cash in {commodity}",
+                    [
+                        new_posting(
+                            f"{account}:{commodity}", fmt(units, ".3f"), commodity, cost
+                        ),
+                        new_posting(f"{account}:Cash", fmt(-amount_cash, ".2f"), "CCY"),
+                    ],
+                    lineno=3,
+                )
             )
 
             balance.add_amount(amount.Amount(-amount_cash, "CCY"))
@@ -813,13 +891,18 @@ def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks
             # Create an entry offering dividends of 1% of the portfolio.
             portfolio_cost = total.reduce(convert.get_cost).get_currency_units("CCY").number
             amount_cash = (frac_dividend * portfolio_cost).quantize(D("0.01"))
-            amount_cash_neg = -amount_cash
             stock = random.choice(stocks)
-            cash_dividend = parse(f"""
-              {next_dividend_date} * "Dividends on portfolio"
-                {account}:Cash        {amount_cash:.2f} CCY
-                {income}:{stock}:{dividends}   {amount_cash_neg:.2f} CCY
-            """)[0]
+            cash_dividend = new_transaction(
+                next_dividend_date,
+                None,
+                "Dividends on portfolio",
+                [
+                    new_posting(account_cash, fmt(amount_cash, ".2f"), "CCY"),
+                    new_posting(
+                        f"{income}:{stock}:{dividends}", fmt(-amount_cash, ".2f"), "CCY"
+                    ),
+                ],
+            )
             new_entries.append(cash_dividend)
 
             # Advance the next dividend date.
@@ -846,12 +929,23 @@ def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks
                     # logging.info('Buying %s %s @ %s CCY = %s CCY',
                     #              units, stock, price, units * price)
 
-                    buy = parse(f"""
-                      {date} * "Buy shares of {stock}"
-                        {account}:Cash                  {amount_cash:.2f} CCY
-                        {account}:{stock}               {units:.0f} {stock} {{{price:.2f} CCY}}
-                        Expenses:Financial:Commissions  {commission:.2f} CCY
-                    """)[0]
+                    cost = Cost(fmt(price, ".2f"), "CCY", date, None)
+                    buy = new_transaction(
+                        date,
+                        None,
+                        f"Buy shares of {stock}",
+                        [
+                            new_posting(account_cash, fmt(amount_cash, ".2f"), "CCY"),
+                            new_posting(
+                                f"{account}:{stock}", fmt(units, ".0f"), stock, cost
+                            ),
+                            new_posting(
+                                "Expenses:Financial:Commissions",
+                                fmt(commission, ".2f"),
+                                "CCY",
+                            ),
+                        ],
+                    )
                     new_entries.append(buy)
 
                     account_stock = ":".join([account, stock])
@@ -888,13 +982,25 @@ def generate_taxable_investment(date_begin, date_end, entries, price_map, stocks
             stock = sell_position.units.currency
             amount_cash = market_value - commission
             amount_gain = -gain
-            sell = parse(f"""
-              {date} * "Sell shares of {stock}"
-                {account}:{stock}               {sell_position} @ {price:.2f} CCY
-                {account}:Cash                  {amount_cash:.2f} CCY
-                Expenses:Financial:Commissions  {commission:.2f} CCY
-                {account_gains}                 {amount_gain:.2f} CCY
-            """)[0]
+            sell = new_transaction(
+                date,
+                None,
+                f"Sell shares of {stock}",
+                [
+                    new_posting(
+                        f"{account}:{stock}",
+                        sell_position.units.number,
+                        stock,
+                        sell_position.cost,
+                        amount.Amount(fmt(price, ".2f"), "CCY"),
+                    ),
+                    new_posting(account_cash, fmt(amount_cash, ".2f"), "CCY"),
+                    new_posting(
+                        "Expenses:Financial:Commissions", fmt(commission, ".2f"), "CCY"
+                    ),
+                    new_posting(account_gains, fmt(amount_gain, ".2f"), "CCY"),
+                ],
+            )
             new_entries.append(sell)
 
             balances[account_cash].add_position(sell.postings[1])
@@ -928,13 +1034,16 @@ def generate_periodic_expenses(
         txn_narration = (
             narration if isinstance(narration, str) else random.choice(narration)
         )
-        amount_neg = -amount
-        new_entries.extend(
-            parse(f"""
-          {date} * "{txn_payee}" "{txn_narration}"
-            {account_from}    {amount_neg:.2f} CCY
-            {account_to}      {amount:.2f} CCY
-        """)
+        new_entries.append(
+            new_transaction(
+                date,
+                txn_payee,
+                txn_narration,
+                [
+                    new_posting(account_from, fmt(-amount, ".2f"), "CCY"),
+                    new_posting(account_to, fmt(amount, ".2f"), "CCY"),
+                ],
+            )
         )
 
     return new_entries
@@ -971,12 +1080,16 @@ def generate_clearing_entries(
         if next_date <= txn_posting.txn.date:
             pos_amount = balance_clear.get_currency_units("CCY")
             neg_amount = -pos_amount
-            new_entries.extend(
-                parse(f"""
-              {next_date} * "{payee}" "{narration}"
-                {account_clear}     {neg_amount.number:.2f} CCY
-                {account_from}      {pos_amount.number:.2f} CCY
-            """)
+            new_entries.append(
+                new_transaction(
+                    next_date,
+                    payee,
+                    narration,
+                    [
+                        new_posting(account_clear, fmt(neg_amount.number, ".2f"), "CCY"),
+                        new_posting(account_from, fmt(pos_amount.number, ".2f"), "CCY"),
+                    ],
+                )
             )
             balance_clear.add_amount(neg_amount)
 
@@ -1041,13 +1154,16 @@ def generate_outgoing_transfers(
             )
 
             date = txn_posting.txn.date + datetime.timedelta(days=1)
-            amount_transfer_neg = -amount_transfer
-            new_entries.extend(
-                parse(f"""
-              {date} * "Transferring accumulated savings to other account"
-                {account}          {amount_transfer_neg:2f} CCY
-                {account_out}      {amount_transfer:2f} CCY
-            """)
+            new_entries.append(
+                new_transaction(
+                    date,
+                    None,
+                    "Transferring accumulated savings to other account",
+                    [
+                        new_posting(account, fmt(-amount_transfer, "2f"), "CCY"),
+                        new_posting(account_out, fmt(amount_transfer, "2f"), "CCY"),
+                    ],
+                )
             )
 
             offset_amount += amount_transfer
@@ -1121,11 +1237,16 @@ def generate_balance_checks(entries, account, date_iter):
     with contextlib.suppress(StopIteration):
         for txn_posting, balance in postings_for(entries, [account], before=True):
             while txn_posting.txn.date >= next_date:
-                amount = balance[account].get_currency_units("CCY").number
-                balance_checks.extend(
-                    parse(f"""
-                  {next_date} balance {account} {amount} CCY
-                """)
+                number = balance[account].get_currency_units("CCY").number
+                balance_checks.append(
+                    data.Balance(
+                        data.new_metadata("<string>", 2),
+                        next_date,
+                        account,
+                        amount.Amount(number, "CCY"),
+                        None,
+                        None,
+                    )
                 )
                 next_date = next(date_iter)
 
@@ -1353,13 +1474,17 @@ def generate_trip_entries(
         for payee, account_expense, (mu, sigma3) in config:
             if random.random() < p_day_generate:
                 amount = random.normalvariate(mu, sigma3 / 3.0)
-                amount_neg = -amount
-                new_entries.extend(
-                    parse(f"""
-                  {date} * "{payee}" "" #{tag}
-                    {account_credit}     {amount_neg:.2f} CCY
-                    {account_expense}    {amount:.2f} CCY
-                """)
+                new_entries.append(
+                    new_transaction(
+                        date,
+                        payee,
+                        "",
+                        [
+                            new_posting(account_credit, fmt(-amount, ".2f"), "CCY"),
+                            new_posting(account_expense, fmt(amount, ".2f"), "CCY"),
+                        ],
+                        tags=frozenset([tag]),
+                    )
                 )
 
     # Consume the vacation days.
