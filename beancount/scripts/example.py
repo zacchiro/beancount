@@ -29,7 +29,6 @@ from beancount.core import display_context
 from beancount.core import getters
 from beancount.core import inventory
 from beancount.core import prices
-from beancount.core import realization
 from beancount.core.account import join
 from beancount.core.number import ZERO
 from beancount.core.number import D
@@ -322,17 +321,14 @@ def merge_postings(entries, accounts):
     Returns:
       A list of TxnPosting's for all the accounts, in sorted order.
     """
-    real_root = realization.realize(entries)
-    merged_postings = []
-    for account in accounts:
-        real_account = realization.get(real_root, account)
-        if real_account is None:
-            continue
-        merged_postings.extend(
-            txn_posting
-            for txn_posting in real_account.txn_postings
-            if isinstance(txn_posting, data.TxnPosting)
-        )
+    accounts_postings = {account: [] for account in accounts}
+    for entry in entries:
+        if isinstance(entry, data.Transaction):
+            for posting in entry.postings:
+                account_postings = accounts_postings.get(posting.account)
+                if account_postings is not None:
+                    account_postings.append(data.TxnPosting(entry, posting))
+    merged_postings = list(itertools.chain.from_iterable(accounts_postings.values()))
     merged_postings.sort(key=lambda txn_posting: txn_posting.txn.date)
     return merged_postings
 
